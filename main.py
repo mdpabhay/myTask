@@ -1,69 +1,46 @@
 import os
-import asyncio
-import socketio
-from fastapi import FastAPI, HTTPException
+import json
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
 from dotenv import load_dotenv
 import google.generativeai as genai
-import json
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
-# Load environment variables from .env file for API keys and other configurations.
+# Load .env
 load_dotenv()
-
-# --- Configuration ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
 if not GEMINI_API_KEY:
-    # Critical error: application cannot proceed without the API key.
-    raise ValueError("GEMINI_API_KEY environment variable not set. Please set it in your .env file.")
+    raise ValueError("Missing GEMINI_API_KEY in .env")
 
-try:
-    # Initialize the Gemini API client with the provided key.
-    genai.configure(api_key=GEMINI_API_KEY)
-    print("Gemini API configured successfully.")
-except Exception as e:
-    # Log and re-raise if API configuration fails, indicating a setup issue.
-    print(f"Error configuring Gemini API: {e}")
-    raise
-
-# Define the Gemini model to be used for content generation.
-# 'gemini-1.5-flash' is chosen for its balance of speed and capability in evaluation tasks.
+genai.configure(api_key=GEMINI_API_KEY)
 GEMINI_MODEL_NAME = "gemini-1.5-flash"
-gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME)
-print(f"Using Gemini model: {GEMINI_MODEL_NAME}")
+model = genai.GenerativeModel(GEMINI_MODEL_NAME)
 
-# --- FastAPI and Socket.IO Setup ---
+# FastAPI setup
 app = FastAPI()
 
-# Retrieve CLIENT_ORIGIN from environment variables.
-# This value will be set in Render's dashboard during deployment.
-# For local testing, ensure your .env has CLIENT_ORIGIN set (e.g., CLIENT_ORIGIN="*").
-client_origin_env = os.getenv("CLIENT_ORIGIN")
-
-# Process client_origin_env for cors_allowed_origins.
-# If client_origin_env is a comma-separated string, split it into a list.
-# If client_origin_env is None or empty, default to an empty list (no origins allowed by default, safer for production).
-if client_origin_env:
-    # If multiple origins are specified (comma-separated), split them into a list.
-    # Otherwise, treat it as a single string.
-    cors_allowed_origins_list = client_origin_env.split(',') if ',' in client_origin_env else client_origin_env
-else:
-    # Default to an empty list if the environment variable is not set.
-    # This is a safe default, meaning no CORS origins are allowed unless explicitly configured.
-    cors_allowed_origins_list = []
-
-# Initialize Socket.IO server in ASGI mode, allowing specified origins.
-sio = socketio.AsyncServer(
-    async_mode='asgi',
-    cors_allowed_origins=cors_allowed_origins_list # Use the processed list/string
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Use specific domain in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+@app.exception_handler(HTTPException)
+async def custom_http_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.detail}
+    )
 
-# Mount the Socket.IO ASGI application onto the FastAPI application at the root path.
-# This allows both Socket.IO events and standard HTTP requests to be handled by the same server.
-app.mount("/", socketio.ASGIApp(sio, app))
-print("FastAPI and Socket.IO app initialized.")
+# Schema for the POST payload
+class QAInput(BaseModel):
+    question: str
+    answer: str
 
-# --- Gemini Prompt and Structured Output Schema Definition ---
-# This dictionary defines the expected JSON structure for Gemini's evaluation output.
-# It ensures consistent and parseable results for the client.
+# JSON schema to ensure consistent model response
 EVALUATION_SCHEMA = {
     "type": "OBJECT",
     "properties": {
@@ -75,141 +52,64 @@ EVALUATION_SCHEMA = {
         "isOffTopic": {"type": "BOOLEAN"},
         "isDontKnow": {"type": "BOOLEAN"},
     },
-    "required": ["score", "feedback", "sentiment", "moveNextSuggested", "followupQuestion", "isOffTopic", "isDontKnow"],
+    "required": [
+        "score", "feedback", "sentiment",
+        "moveNextSuggested", "followupQuestion",
+        "isOffTopic", "isDontKnow"
+    ]
 }
-print("Evaluation schema defined.")
 
-# This template guides Gemini on how to evaluate the student's answer
-# and format its response according to the defined schema.
-EVALUATION_PROMPT_TEMPLATE = """
+# Prompt Template
+PROMPT_TEMPLATE = """
 You are an AI tutor evaluating a student's answer to a question.
 Your task is to analyze the provided question and the student's answer, and then provide a structured evaluation.
 
 Here's how you should evaluate:
-- **Score**: Assign a score from 0.0 to 1.0, where 1.0 is a perfect answer. Consider correctness, completeness, and clarity.
-- **Feedback**: Provide concise, constructive feedback for improvement. If the answer is perfect, state that.
-- **Sentiment**: Describe the sentiment of the student's answer. Use terms like "confident", "uncertain", "confused", "clear".
-- **moveNextSuggested**: A boolean indicating if the student is ready to move to the next topic (True) or needs more practice/clarification on this topic (False).
-- **followupQuestion**: Suggest a relevant follow-up question to deepen understanding or address gaps. If no follow-up is needed, leave it empty.
-- **isOffTopic**: A boolean indicating if the answer is completely irrelevant to the question.
-- **isDontKnow**: A boolean indicating if the answer explicitly states "I don't know" or clearly implies a lack of knowledge.
+- **Score**: Assign a score from 0.0 to 1.0, where 1.0 is a perfect answer.
+- **Feedback**: Provide concise, constructive feedback.
+- **Sentiment**: Describe the student's tone, e.g., "confident", "uncertain".
+- **moveNextSuggested**: True if ready to move on next topic, else False.
+- **followupQuestion**: Suggest one only if needed of Score less than 0.6, else empty.
+- **isOffTopic**: True if irrelevant.
+- **isDontKnow**: True if the student said "I don't know".
 
-Ensure your output strictly adheres to the JSON format defined by the schema. Do not include any other text outside the JSON.
+Output must be valid JSON with this structure.
 
 Question: {question}
 Answer: {answer}
 """
-print("Evaluation prompt template defined.")
 
-# --- Socket.IO Event Handlers ---
-
-@sio.event
-async def connect(sid: str, environ: dict):
-    """
-    Handles new client connections to the Socket.IO server.
-    :param sid: The session ID of the connected client.
-    :param environ: A dictionary containing environment variables for the connection.
-    """
-    print(f"Client connected: {sid}")
-
-@sio.event
-async def disconnect(sid: str):
-    """
-    Handles client disconnections from the Socket.IO server.
-    :param sid: The session ID of the disconnected client.
-    """
-    print(f"Client disconnected: {sid}")
-
-@sio.event
-async def evaluate_qa(sid: str, data: dict):
-    """
-    Receives a question and answer from the client via a Socket.IO event,
-    processes them using the Gemini API, and emits the structured evaluation back.
-    :param sid: The session ID of the client sending the request.
-    :param data: A dictionary containing 'question' and 'answer' strings.
-    """
-    print(f"Received 'evaluate_qa' from {sid}: {data}")
-
-    question = data.get("question")
-    answer = data.get("answer")
-
-    if not question or not answer:
-        error_message = "Invalid input: 'question' and 'answer' are required."
-        print(f"Error for {sid}: {error_message}")
-        await sio.emit("evaluation_error", {"error": error_message}, room=sid)
-        return
-
+@app.post("/evaluate")
+async def evaluate_qa(payload: QAInput):
     try:
-        # Format the prompt with the received question and answer.
-        full_prompt = EVALUATION_PROMPT_TEMPLATE.format(question=question, answer=answer)
-        print(f"Calling Gemini API for SID {sid} with prompt...")
+        prompt = PROMPT_TEMPLATE.format(question=payload.question, answer=payload.answer)
 
-        # Call the Gemini API to generate the evaluation.
-        # The generation_config ensures the response is JSON and follows the defined schema.
-        response = await genai.GenerativeModel(GEMINI_MODEL_NAME).generate_content_async(
-            contents=[{"text": full_prompt}],
+        response = await model.generate_content_async(
+            contents=[{"text": prompt}],
             generation_config=genai.types.GenerationConfig(
                 response_mime_type="application/json",
                 response_schema=EVALUATION_SCHEMA,
-                temperature=0.2, # Lower temperature for more deterministic and factual output.
+                temperature=0.2,
                 top_p=0.9,
                 top_k=40,
             )
         )
-        print(f"Gemini API call completed for SID {sid}. Processing response...")
 
-        # Extract the raw JSON string from Gemini's response.
-        evaluation_result_str = response.text
-        print(f"Gemini raw response for {sid}: {evaluation_result_str}")
+        response_text = response.text
+        parsed = json.loads(response_text)
 
-        try:
-            # Parse the JSON string into a Python dictionary.
-            parsed_evaluation = json.loads(evaluation_result_str)
-            print(f"Parsed evaluation for {sid}: {parsed_evaluation}")
+        # Business rule: clear followupQuestion if score > 0.65
+        if parsed.get("score", 0.0) > 0.65:
+            parsed["followupQuestion"] = ""
 
-            # Implement the feature: if score > 0.65, clear the followupQuestion.
-            if parsed_evaluation.get("score", 0.0) > 0.65:
-                print(f"Score {parsed_evaluation['score']} > 0.65. Clearing followupQuestion for SID {sid}.")
-                parsed_evaluation["followupQuestion"] = ""
+        return parsed
 
-            # Convert the potentially modified dictionary back to a JSON string for emission.
-            final_evaluation_result = json.dumps(parsed_evaluation)
-            print(f"Final evaluation result to emit for {sid}: {final_evaluation_result}")
-
-        except json.JSONDecodeError as json_e:
-            # Handle cases where Gemini's response is not valid JSON.
-            error_message = f"Gemini returned invalid JSON. Raw response: {evaluation_result_str}. Error: {json_e}"
-            print(f"JSON Parsing Error for {sid}: {error_message}")
-            await sio.emit("evaluation_error", {"error": error_message}, room=sid)
-            return
-
-        # Emit the final structured evaluation result back to the client.
-        await sio.emit("evaluation_result", final_evaluation_result, room=sid)
-        print(f"Emitted evaluation_result to {sid}")
+    except json.JSONDecodeError as je:
+        raise HTTPException(status_code=500, detail=f"Invalid JSON returned from Gemini: {je}")
 
     except Exception as e:
-        # Catch any unexpected errors during the API call or processing.
-        error_message = f"An unexpected error occurred during Gemini API call or processing: {type(e).__name__}: {e}"
-        print(f"Caught an exception for SID {sid}: {error_message}")
-        await sio.emit("evaluation_error", {"error": error_message}, room=sid)
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
-# --- FastAPI REST Endpoint (for health check or direct access) ---
 @app.get("/")
-async def read_root():
-    """
-    Root endpoint for the FastAPI application.
-    Returns a simple message indicating the server is running.
-    """
-    return {"message": "Gemini AI Tutor FastAPI Server is running. Connect via Socket.IO."}
-
-# --- Execution Instructions ---
-# To run this application:
-# 1. Save the code as `main.py`.
-# 2. Create a `.env` file in the same directory and add your Gemini API key:
-#    GEMINI_API_KEY="YOUR_API_KEY_HERE"
-#    CLIENT_ORIGIN="http://127.0.0.1:5500" (for local testing with Live Server)
-#    OR CLIENT_ORIGIN="*" (for broader local testing)
-# 3. Install necessary libraries (if not already installed in your virtual environment):
-#    pip install fastapi uvicorn python-socketio python-dotenv google-generativeai gunicorn
-# 4. Run the server from your terminal:
-#    uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+async def root():
+    return {"message": "Gemini QA Evaluator API is running"}
