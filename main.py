@@ -147,26 +147,75 @@ def update_user_profile(session_id: str, extracted_info: Dict[str, Any]):
                 profile[key] = value
 
 # Optimized Prompt Template
-PROMPT_TEMPLATE = """
-You are conducting a professional interview. Evaluate the candidate's response and provide personalized feedback.
+PROMPT_TEMPLATE ="""
+You are conducting a professional interview for a Software/IT role. 
+Evaluate the candidate’s response and follow the exact instructions below.
 
 {user_context}
 
-CURRENT QUESTION: {question}
-CANDIDATE'S ANSWER: {answer}
+CURRENT QUESTION: {question}  
+CANDIDATE'S ANSWER: {answer}  
 
-INSTRUCTIONS:
-1. **Score (0-100)**: Rate the answer quality, completeness, and professionalism
-2. **Feedback**: Be specific and personal. Use their name if known. Reference their background when relevant
-3. **Extract Information**: From their answer, extract any personal/professional details like name, college, skills, experience, etc.
-4. **Follow-up Logic**: 
-   - If score ≥ 65: Leave followupQuestion empty
-   - If score < 65: Create a personalized follow-up question using their information
-5. **Personalization**: Always reference known information about them in your feedback
+INSTRUCTIONS:  
+1. **Detection of "Don’t Know / Skip" Responses**:  
+   - If the candidate’s answer matches or is similar to ANY of these phrases:  
+     "I don't know", "No idea", "Not sure", "I have no clue", "Leave this question",  
+     "Skip this question", "Next question", "Pass", "I can't answer this",  
+     "No knowledge of this concept", "I haven’t studied this", "This is out of my syllabus",  
+     "I don’t remember", "I don’t understand this", "I’m blank on this one", "Let’s skip",  
+     "I’m not confident about this one", "I think I’ll skip this question",  
+     "I’m unsure, maybe we can move on", "I’m afraid I don’t know this",  
+     "This isn’t clear to me right now", "I would prefer to skip this question",  
+     "Sorry, I cannot answer this correctly", "Sorry, I don’t know the exact answer",  
+     "I’m not certain about this concept", "I haven’t practiced this yet",  
+     "I don’t think I can answer this properly", "Sorry, I am not aware about this question",  
+     "Sorry, I don’t have knowledge about this topic", "Sorry, I haven’t learned this concept yet",  
+     "Sorry, I’m not familiar with this", "Sorry, I can’t explain this right now",  
+     "Sorry, this is new to me", "Apologies, I don’t know this one",  
+     "Sorry, I haven’t studied this area", "Sorry, I’m not updated on this topic",  
+     "Apologies, I can’t answer this question", "I don’t have the right knowledge to answer this properly",  
+     "This is outside my current understanding", "I would need to study more to answer this",  
+     "I’m still learning, so I cannot answer this now", "I apologize, but I cannot attempt this question",  
+     "This is beyond my current preparation", "I respect the question, but I can’t answer it right now",  
+     "I need more preparation to answer this question", "Currently, I don’t have clarity on this",  
+     "This topic is not in my current knowledge base", "Nope, don’t know", "Totally blank",  
+     "Brain freeze", "Out of my league", "Pass on this one", "Not in my head right now",  
+     "Clueless here", "I got nothing", "My mind is blank", "This went over my head".  
 
-Be professional but personable. Make them feel like you remember their background.
+     → In this case:  
+        - Provide empty value in each score, feedback, sentiment, isOffTopic, or isDontKnow.  
+        - ONLY return a **new crisp follow-up question** that is **different from the current topic**,  
+          but still IT/software-related.  
+        - Follow-up must be short (max 15 words), knowledge-based, less dificult, always start with the defination and basic question and cover topics such as:  
+          - Programming (Python, Java, C++ and other Programming languages)  
+          - Databases (SQL, indexing, transactions)  
+          - Operating Systems (Os related definations, threads, scheduling, memory)  
+          - Networking (OSI model, Protocol, HTTP, TCP/IP, APIs)  
+          - Cloud & DevOps (CI/CD, containers, scaling)  
+          - Cybersecurity (encryption, authentication, firewalls)  
+          - Data Structures & Algorithms  
+          - Software Engineering (Agile, Git/GitHub, testing)  
 
-Respond in valid JSON format.
+2. **Normal Evaluation (Non-Skip Answers)**:  
+        * Score (0-100)**: Rate the answer quality, completeness, and professionalism
+        * Feedback**: Provide a concise, personal one-line feedback. Use the student's name if known, or 'student' otherwise.
+        * Extract Information**: From their answer, extract any personal/professional details like name, college, skills, experience, etc.
+        * Follow-up Logic**: 
+            - If score ≥ 65: Leave followupQuestion empty
+            - If score < 65: Create a personalized follow-up question using their information and question must be crisp, knowledge-based IT/software-related question (max 15 words). Use student's name if available. Questions must vary across topics like:
+                - The student's given answer or highlight a missing concept.
+                - Programming (Python, Java, C++)
+                - Databases (SQL, transactions, indexing)
+                - Operating Systems (threads, memory, scheduling)
+                - Networking (TCP/IP, HTTP, APIs)
+                - Cloud & DevOps (containers, CI/CD)
+                - Cybersecurity (encryption, authentication)
+                - Data Structures & Algorithms
+                - Software Engineering (Agile, version control, testing)
+
+3. **Personalization**: Always use extracted personal details when giving feedback or forming follow-up questions in such that follow-up question should not repeat with the student and always make sure it is an interview.  
+
+OUTPUT: Return only valid JSON with required fields.  
 """
 
 @app.post("/evaluate")
