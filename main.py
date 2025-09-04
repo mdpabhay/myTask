@@ -1,12 +1,15 @@
 import os
 import json
-from fastapi import FastAPI, HTTPException, Request
+import uuid
+import hashlib
+from fastapi import FastAPI, HTTPException, Request, Header
 from pydantic import BaseModel
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
 import google.generativeai as genai
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+import threading
 
 # Load .env
 load_dotenv()
@@ -30,9 +33,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory storage for user data (until server restarts)
+# Thread-safe storage for user data with locks
 USER_PROFILES: Dict[str, Dict[str, Any]] = {}
 CONVERSATION_HISTORY: Dict[str, List[Dict[str, str]]] = {}
+_profile_locks: Dict[str, threading.Lock] = {}
+_main_lock = threading.Lock()
 
 @app.exception_handler(HTTPException)
 async def custom_http_exception_handler(request, exc):
@@ -81,75 +86,108 @@ EVALUATION_SCHEMA = {
     ]
 }
 
-def get_session_id(request) -> str:
-    """Generate session ID from client info (simplified for demo)"""
-    # In production, use proper session management
+def get_session_id(request: Request, user_session: Optional[str] = None) -> str:
+    """Generate unique session ID with multiple fallbacks for isolation"""
+    if user_session:
+        # Use provided session ID (recommended)
+        return f"usr_{hashlib.md5(user_session.encode()).hexdigest()[:12]}"
+    
+    # Fallback: Generate from multiple request attributes
     try:
-        client_ip = request.client.host if request.client else 'default'
+        client_ip = request.client.host if request.client else 'unknown'
+        user_agent = request.headers.get("user-agent", "unknown")
+        x_forwarded = request.headers.get("x-forwarded-for", "")
+        
+        # Create unique identifier
+        unique_string = f"{client_ip}_{user_agent}_{x_forwarded}_{id(request)}"
+        session_hash = hashlib.md5(unique_string.encode()).hexdigest()[:12]
+        return f"auto_{session_hash}"
     except:
-        client_ip = 'default'
-    return f"session_{hash(client_ip) % 1000000}"
+        # Ultimate fallback
+        return f"fallback_{uuid.uuid4().hex[:12]}"
+
+def get_user_lock(session_id: str) -> threading.Lock:
+    """Get thread-safe lock for specific user session"""
+    with _main_lock:
+        if session_id not in _profile_locks:
+            _profile_locks[session_id] = threading.Lock()
+        return _profile_locks[session_id]
 
 def get_user_context(session_id: str) -> str:
-    """Build context string from stored user information"""
-    if session_id not in USER_PROFILES:
-        return "CONTEXT: This is the first interaction with this user. Extract and remember their personal/professional information."
-    
-    profile = USER_PROFILES[session_id]
-    context_parts = ["KNOWN USER INFORMATION:"]
-    
-    if profile.get("name"):
-        context_parts.append(f"Name: {profile['name']}")
-    if profile.get("college"):
-        context_parts.append(f"College: {profile['college']}")
-    if profile.get("degree"):
-        context_parts.append(f"Degree: {profile['degree']}")
-    if profile.get("address"):
-        context_parts.append(f"Location: {profile['address']}")
-    if profile.get("skills"):
-        context_parts.append(f"Skills: {', '.join(profile['skills'])}")
-    if profile.get("experience"):
-        context_parts.append(f"Experience: {profile['experience']}")
-    if profile.get("previousCompanies"):
-        context_parts.append(f"Companies: {', '.join(profile['previousCompanies'])}")
-    if profile.get("specialization"):
-        context_parts.append(f"Specialization: {profile['specialization']}")
-    if profile.get("projects"):
-        context_parts.append(f"Projects: {', '.join(profile['projects'])}")
-    if profile.get("careerGoals"):
-        context_parts.append(f"Career Goals: {profile['careerGoals']}")
-    
-    context_parts.append("\nUSE this information to personalize your feedback and questions. Address them by name and reference their background.")
-    return "\n".join(context_parts)
+    """Thread-safe context retrieval"""
+    user_lock = get_user_lock(session_id)
+    with user_lock:
+        if session_id not in USER_PROFILES:
+            return "CONTEXT: This is the first interaction with this user. Extract and remember their personal/professional information."
+        
+        profile = USER_PROFILES[session_id]
+        context_parts = ["KNOWN USER INFORMATION:"]
+        
+        if profile.get("name"):
+            context_parts.append(f"Name: {profile['name']}")
+        if profile.get("college"):
+            context_parts.append(f"College: {profile['college']}")
+        if profile.get("degree"):
+            context_parts.append(f"Degree: {profile['degree']}")
+        if profile.get("address"):
+            context_parts.append(f"Location: {profile['address']}")
+        if profile.get("skills"):
+            context_parts.append(f"Skills: {', '.join(profile['skills'])}")
+        if profile.get("experience"):
+            context_parts.append(f"Experience: {profile['experience']}")
+        if profile.get("previousCompanies"):
+            context_parts.append(f"Companies: {', '.join(profile['previousCompanies'])}")
+        if profile.get("specialization"):
+            context_parts.append(f"Specialization: {profile['specialization']}")
+        if profile.get("projects"):
+            context_parts.append(f"Projects: {', '.join(profile['projects'])}")
+        if profile.get("careerGoals"):
+            context_parts.append(f"Career Goals: {profile['careerGoals']}")
+        
+        context_parts.append("\nUSE this information to personalize your feedback and questions. Address them by name and reference their background.")
+        return "\n".join(context_parts)
 
 def update_user_profile(session_id: str, extracted_info: Dict[str, Any]):
-    """Update user profile with newly extracted information"""
-    if session_id not in USER_PROFILES:
-        USER_PROFILES[session_id] = {}
-    
-    profile = USER_PROFILES[session_id]
-    
-    # Update with new information, merging arrays
-    for key, value in extracted_info.items():
-        if not value:  # Skip empty values
-            continue
-            
-        if key in ["skills", "previousCompanies", "achievements", "projects", "certifications"]:
-            # Merge arrays, avoid duplicates
-            if key not in profile:
-                profile[key] = []
-            for item in value:
-                if item and item not in profile[key]:
-                    profile[key].append(item)
-        else:
-            # Update single values only if new value is more detailed
-            if key not in profile or len(str(value)) > len(str(profile.get(key, ""))):
-                profile[key] = value
+    """Thread-safe profile update"""
+    user_lock = get_user_lock(session_id)
+    with user_lock:
+        if session_id not in USER_PROFILES:
+            USER_PROFILES[session_id] = {}
+        
+        profile = USER_PROFILES[session_id]
+        
+        # Update with new information, merging arrays
+        for key, value in extracted_info.items():
+            if not value:  # Skip empty values
+                continue
+                
+            if key in ["skills", "previousCompanies", "achievements", "projects", "certifications"]:
+                # Merge arrays, avoid duplicates
+                if key not in profile:
+                    profile[key] = []
+                for item in value:
+                    if item and item not in profile[key]:
+                        profile[key].append(item)
+            else:
+                # Update single values only if new value is more detailed
+                if key not in profile or len(str(value)) > len(str(profile.get(key, ""))):
+                    profile[key] = value
+
+def store_conversation(session_id: str, question: str, answer: str):
+    """Thread-safe conversation storage"""
+    user_lock = get_user_lock(session_id)
+    with user_lock:
+        if session_id not in CONVERSATION_HISTORY:
+            CONVERSATION_HISTORY[session_id] = []
+        CONVERSATION_HISTORY[session_id].append({
+            "question": question,
+            "answer": answer
+        })
 
 # Optimized Prompt Template
-PROMPT_TEMPLATE ="""
+PROMPT_TEMPLATE = """
 You are conducting a professional interview for a Software/IT role. 
-Evaluate the candidate’s response and follow the exact instructions below.
+Evaluate the candidate's response and follow the exact instructions below.
 
 {user_context}
 
@@ -157,39 +195,40 @@ CURRENT QUESTION: {question}
 CANDIDATE'S ANSWER: {answer}  
 
 INSTRUCTIONS:  
-1. **Detection of "Don’t Know / Skip" Responses**:  
-   - If the candidate’s answer matches or is similar to ANY of these phrases:  
+1. **Detection of "Don't Know / Skip" Responses**:  
+   - If the candidate's answer matches or is similar to ANY of these phrases:  
      "I don't know", "No idea", "Not sure", "I have no clue", "Leave this question",  
      "Skip this question", "Next question", "Pass", "I can't answer this",  
-     "No knowledge of this concept", "I haven’t studied this", "This is out of my syllabus",  
-     "I don’t remember", "I don’t understand this", "I’m blank on this one", "Let’s skip",  
-     "I’m not confident about this one", "I think I’ll skip this question",  
-     "I’m unsure, maybe we can move on", "I’m afraid I don’t know this",  
-     "This isn’t clear to me right now", "I would prefer to skip this question",  
-     "Sorry, I cannot answer this correctly", "Sorry, I don’t know the exact answer",  
-     "I’m not certain about this concept", "I haven’t practiced this yet",  
-     "I don’t think I can answer this properly", "Sorry, I am not aware about this question",  
-     "Sorry, I don’t have knowledge about this topic", "Sorry, I haven’t learned this concept yet",  
-     "Sorry, I’m not familiar with this", "Sorry, I can’t explain this right now",  
-     "Sorry, this is new to me", "Apologies, I don’t know this one",  
-     "Sorry, I haven’t studied this area", "Sorry, I’m not updated on this topic",  
-     "Apologies, I can’t answer this question", "I don’t have the right knowledge to answer this properly",  
+     "No knowledge of this concept", "I haven't studied this", "This is out of my syllabus",  
+     "I don't remember", "I don't understand this", "I'm blank on this one", "Let's skip",  
+     "I'm not confident about this one", "I think I'll skip this question",  
+     "I'm unsure, maybe we can move on", "I'm afraid I don't know this",  
+     "This isn't clear to me right now", "I would prefer to skip this question",  
+     "Sorry, I cannot answer this correctly", "Sorry, I don't know the exact answer",  
+     "I'm not certain about this concept", "I haven't practiced this yet",  
+     "I don't think I can answer this properly", "Sorry, I am not aware about this question",  
+     "Sorry, I don't have knowledge about this topic", "Sorry, I haven't learned this concept yet",  
+     "Sorry, I'm not familiar with this", "Sorry, I can't explain this right now",  
+     "Sorry, this is new to me", "Apologies, I don't know this one",  
+     "Sorry, I haven't studied this area", "Sorry, I'm not updated on this topic",  
+     "Apologies, I can't answer this question", "I don't have the right knowledge to answer this properly",  
      "This is outside my current understanding", "I would need to study more to answer this",  
-     "I’m still learning, so I cannot answer this now", "I apologize, but I cannot attempt this question",  
-     "This is beyond my current preparation", "I respect the question, but I can’t answer it right now",  
-     "I need more preparation to answer this question", "Currently, I don’t have clarity on this",  
-     "This topic is not in my current knowledge base", "Nope, don’t know", "Totally blank",  
+     "I'm still learning, so I cannot answer this now", "I apologize, but I cannot attempt this question",  
+     "This is beyond my current preparation", "I respect the question, but I can't answer it right now",  
+     "I need more preparation to answer this question", "Currently, I don't have clarity on this",  
+     "This topic is not in my current knowledge base", "Nope, don't know", "Totally blank",  
      "Brain freeze", "Out of my league", "Pass on this one", "Not in my head right now",  
      "Clueless here", "I got nothing", "My mind is blank", "This went over my head".  
 
      → In this case:  
-        - Provide empty value in each score, feedback, sentiment, isOffTopic, or isDontKnow.  
+        - Set isDontKnow: true
+        - Set score: 0, feedback: "", sentiment: "", isOffTopic: false, moveNextSuggested: false
         - ONLY return a **new crisp follow-up question** that is **different from the current topic**,  
           but still IT/software-related.  
-        - Follow-up must be short (max 15 words), knowledge-based, less dificult, always start with the defination and basic question and cover topics such as:  
+        - Follow-up must be short (max 15 words), knowledge-based, less difficult, always start with the definition and basic question and cover topics such as:  
           - Programming (Python, Java, C++ and other Programming languages)  
           - Databases (SQL, indexing, transactions)  
-          - Operating Systems (Os related definations, threads, scheduling, memory)  
+          - Operating Systems (OS related definitions, threads, scheduling, memory)  
           - Networking (OSI model, Protocol, HTTP, TCP/IP, APIs)  
           - Cloud & DevOps (CI/CD, containers, scaling)  
           - Cybersecurity (encryption, authentication, firewalls)  
@@ -197,10 +236,10 @@ INSTRUCTIONS:
           - Software Engineering (Agile, Git/GitHub, testing)  
 
 2. **Normal Evaluation (Non-Skip Answers)**:  
-        * Score (0-100)**: Rate the answer quality, completeness, and professionalism
-        * Feedback**: Provide a concise, personal one-line feedback. Use the student's name if known, or 'student' otherwise.
-        * Extract Information**: From their answer, extract any personal/professional details like name, college, skills, experience, etc.
-        * Follow-up Logic**: 
+        - **Score (0-100)**: Rate the answer quality, completeness, and professionalism
+        - **Feedback**: Provide a concise, personal one-line feedback. Use the student's name if known, or 'student' otherwise.
+        - **Extract Information**: From their answer, extract any personal/professional details like name, college, skills, experience, etc.
+        - **Follow-up Logic**: 
             - If score ≥ 65: Leave followupQuestion empty
             - If score < 65: Create a personalized follow-up question using their information and question must be crisp, knowledge-based IT/software-related question (max 15 words). Use student's name if available. Questions must vary across topics like:
                 - The student's given answer or highlight a missing concept.
@@ -219,21 +258,20 @@ OUTPUT: Return only valid JSON with required fields.
 """
 
 @app.post("/evaluate")
-async def evaluate_qa(payload: QAInput, request: Request):
+async def evaluate_qa(
+    payload: QAInput, 
+    request: Request,
+    x_user_session: Optional[str] = Header(None, alias="X-User-Session")
+):
     try:
-        # Get or create session
-        session_id = get_session_id(request)
+        # Get unique session ID for this user
+        session_id = get_session_id(request, x_user_session)
         
-        # Build user context
+        # Build user context (thread-safe)
         user_context = get_user_context(session_id)
         
-        # Store conversation history
-        if session_id not in CONVERSATION_HISTORY:
-            CONVERSATION_HISTORY[session_id] = []
-        CONVERSATION_HISTORY[session_id].append({
-            "question": payload.question,
-            "answer": payload.answer
-        })
+        # Store conversation history (thread-safe)
+        store_conversation(session_id, payload.question, payload.answer)
         
         # Format prompt
         prompt = PROMPT_TEMPLATE.format(
@@ -257,7 +295,7 @@ async def evaluate_qa(payload: QAInput, request: Request):
         response_text = response.text
         parsed = json.loads(response_text)
 
-        # Update user profile with extracted information
+        # Update user profile with extracted information (thread-safe)
         if "extractedUserInfo" in parsed:
             extracted_info = parsed["extractedUserInfo"]
             # Clean empty values
@@ -290,20 +328,3 @@ async def evaluate_qa(payload: QAInput, request: Request):
 @app.get("/")
 async def root():
     return {"message": "Smart Interview Evaluator API is running"}
-
-@app.get("/debug/profile/{session_id}")
-async def get_user_profile(session_id: str):
-    """Debug endpoint to see stored user profile"""
-    return {
-        "profile": USER_PROFILES.get(session_id, {}),
-        "conversation_count": len(CONVERSATION_HISTORY.get(session_id, []))
-    }
-
-@app.delete("/reset/{session_id}")
-async def reset_session(session_id: str):
-    """Reset user session data"""
-    if session_id in USER_PROFILES:
-        del USER_PROFILES[session_id]
-    if session_id in CONVERSATION_HISTORY:
-        del CONVERSATION_HISTORY[session_id]
-    return {"message": f"Session {session_id} reset successfully"}
