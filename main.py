@@ -223,7 +223,7 @@ INSTRUCTIONS:
      → In this case:  
         - Set isDontKnow: true
         - Set score: 0, feedback: "", sentiment: "", isOffTopic: false, moveNextSuggested: false
-        - ONLY return a **new crisp follow-up question** that is **different from the current topic**,  
+        - ONLY return a **new crisp follow-up question(max 14 words)** that is **different from the current topic**,  
           but still IT/software-related.  
         - Follow-up must be short (max 15 words), knowledge-based, less difficult, always start with the definition and basic question and cover topics such as:  
           - Programming (Python, Java, C++ and other Programming languages)  
@@ -237,7 +237,7 @@ INSTRUCTIONS:
 
 2. **Normal Evaluation (Non-Skip Answers)**:  
         - **Score (0-100)**: Rate the answer quality, completeness, and professionalism
-        - **Feedback**: Provide a concise, personal one-line feedback. Use the student's name if known, or 'student' otherwise.
+        - **Feedback**: Provide a concise, personal one-line feedback and must be short (max 15 words). Use the student's name and ohter info if known, or 'student' otherwise.
         - **Extract Information**: From their answer, extract any personal/professional details like name, college, skills, experience, etc.
         - **Follow-up Logic**: 
             - If score ≥ 65: Leave followupQuestion empty
