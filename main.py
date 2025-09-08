@@ -331,6 +331,7 @@ async def evaluate_qa(
             "sentiment": parsed.get("sentiment", "Neutral")
         }
 
+        print(result)
         return result
 
     except json.JSONDecodeError as je:
@@ -341,3 +342,4 @@ async def evaluate_qa(
 @app.get("/")
 async def root():
     return {"message": "Smart Interview Evaluator API is running"}
+
